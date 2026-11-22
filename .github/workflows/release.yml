@@ -1,0 +1,516 @@
+# Keepsake 构建专库 — 分 ABI 构建 + 差分补丁 + Release 发布。
+#
+# 这里**只有构建/发布规则**，源码在 2806577488/keepsake（公开库，只读拉取）。
+# 版本号、资产命名、补丁格式、保留策略见 RELEASE.md。
+#
+# 触发：
+#   1. workflow_dispatch：可指定源码 ref（tag 或 main）与版本号；
+#   2. schedule（每天 03:00 UTC）：检测 keepsake 有没有新 tag，有就构建；
+#      已发布过的版本自动跳过（除非手动勾 force）。
+#
+# 签名：仓库 Secrets 里配 KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS /
+#       KEY_PASSWORD 才走正式签名；否则源码库的 build.gradle.kts 会回退 debug 签名。
+#       **注意**：不同签名的 APK 不能覆盖安装，正式发布前务必配好 Secrets。
+name: Keepsake 发布构建
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'keepsake 源码 ref（如 v0.4.21 或 main）。留空 = 取 keepsake 最新 tag'
+        required: false
+        default: ''
+      version:
+        description: '发布版本号（不带 v）。留空 = 从 ref / 源码 pubspec.yaml 推导'
+        required: false
+        default: ''
+      force:
+        description: '该版本已有 Release 也重新构建并覆盖'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepsake-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: 2806577488/keepsake
+  # 保留最近多少个 Release（更旧的连 tag 一起删）。
+  KEEP_RELEASES: '10'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) 解析版本 + 判断要不要构建
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: 解析版本
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - name: 检出构建库
+        uses: actions/checkout@v4
+
+      - name: 解析目标版本
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ github.event.inputs.source_ref }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          # 源码 ref：手填 > 源码库最新 tag（按版本号排序，不依赖 API 顺序）
+          if [ -n "${INPUT_REF:-}" ]; then
+            REF="$INPUT_REF"
+          else
+            REF="$(git ls-remote --tags --refs "https://github.com/${SOURCE_REPO}.git" \
+              | awk '{print $2}' | sed 's#refs/tags/##' | sort -V | tail -1)"
+          fi
+          if [ -z "$REF" ]; then
+            echo '错误：解析不到源码 ref' >&2
+            exit 1
+          fi
+
+          # 版本号：手填 > ref 是 tag > 源码 pubspec.yaml
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            RAW="$INPUT_VERSION"
+          elif printf '%s' "$REF" | grep -qE '^v[0-9]'; then
+            RAW="$REF"
+          else
+            RAW="$(curl -fsSL "https://raw.githubusercontent.com/${SOURCE_REPO}/${REF}/pubspec.yaml" \
+              | awk '/^version:/{print $2; exit}')"
+          fi
+          VERSION="${RAW#v}"
+          VERSION="${VERSION%%+*}"
+          VERSION="$(printf '%s' "$VERSION" | tr -d '[:space:]')"
+          if [ -z "$VERSION" ]; then
+            echo '错误：无法确定版本号' >&2
+            exit 1
+          fi
+
+          BUILD="true"
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            if [ "${FORCE:-}" = "true" ]; then
+              echo "v${VERSION} 已有 Release，按 force 重建"
+            else
+              echo "v${VERSION} 已经发布过，跳过（要重建请手动触发并勾 force）"
+              BUILD="false"
+            fi
+          fi
+
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "本次：ref=$REF, version=$VERSION, build=$BUILD"
+
+  # ---------------------------------------------------------------------------
+  # 2) 分 ABI 构建（两个包各自独立，互不影响）
+  # ---------------------------------------------------------------------------
+  build:
+    name: 构建 ${{ matrix.abi }}
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64
+            target: android-arm64
+          - abi: arm
+            target: android-arm
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: 检出源码库
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.ref }}
+          path: src
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.50.1
+          cache: true
+
+      - name: 安装依赖
+        working-directory: src
+        run: flutter pub get
+
+      - name: 配置 release 签名
+        if: env.KEYSTORE_BASE64 != ''
+        working-directory: src
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > android/keystore.jks
+          {
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storeFile=keystore.jks"
+          } > android/key.properties
+          test -s android/keystore.jks
+          echo '已写入 keystore（release 正式签名）'
+
+      - name: 提示使用调试签名
+        if: env.KEYSTORE_BASE64 == ''
+        run: |
+          echo '::warning::未配置签名 Secrets，将使用 debug 签名（无法覆盖安装正式版）。'
+          echo 'debug keystore 会缓存复用，尽量保证多次构建的签名一致；正式发布请配 KEYSTORE_*。'
+
+      - name: 缓存 debug keystore（未配正式签名时保持签名一致）
+        if: env.KEYSTORE_BASE64 == ''
+        uses: actions/cache@v4
+        with:
+          # 固定 key：同一份 debug keystore 在所有构建里复用，
+          # 否则每次 runner 都新生成一个 → App 内更新会报「签名不一致」。
+          path: ~/.android/debug.keystore
+          key: keepsake-debug-keystore-v1
+
+      - name: 缓存 Gradle 依赖
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 构建 ${{ matrix.abi }} APK
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # Maven Central 会对 CI 共享 IP 返回 429，失败后重试 3 次。
+          for attempt in 1 2 3; do
+            echo "构建尝试 $attempt/3（${{ matrix.target }}）"
+            if flutter build apk --release --target-platform ${{ matrix.target }}; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo '构建失败，20 秒后重试（多半是 Maven 限流）'
+              sleep 20
+            fi
+          done
+          echo '三次构建均失败，请查看上方 Gradle 日志' >&2
+          exit 1
+
+      - name: 重命名并生成 SHA256
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          APK="keepsake-${VERSION}-${{ matrix.abi }}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/${APK}"
+          ( cd dist && sha256sum "$APK" > "${APK}.sha256" )
+          cat "dist/${APK}.sha256"
+          ls -l "dist/${APK}"
+
+      - name: 记录签名证书指纹
+        working-directory: src
+        run: |
+          set -euo pipefail
+          APK="dist/keepsake-${VERSION}-${{ matrix.abi }}.apk"
+          CERT="dist/cert-${VERSION}-${{ matrix.abi }}.txt"
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          APKSIGNER="$(ls -d "$SDK"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -z "$APKSIGNER" ]; then
+            APKSIGNER="$(command -v apksigner || true)"
+          fi
+          if [ -n "$APKSIGNER" ]; then
+            # 签名不一致时 verify 会非零退出，这里只记录、不中断构建。
+            if ! "$APKSIGNER" verify --print-certs "$APK" > "$CERT" 2>&1; then
+              echo '::warning::apksigner verify 返回非零，证书信息可能不完整'
+            fi
+          else
+            echo '::warning::找不到 apksigner，改用 keytool'
+            keytool -printcert -jarfile "$APK" > "$CERT" 2>&1 || true
+          fi
+          cat "$CERT"
+          grep -E "Signer #1 certificate SHA-256|SHA256:" "$CERT" | head -3 || true
+          if grep -qi "Android Debug" "$CERT"; then
+            echo '::warning::这个 APK 是 debug 签名，无法覆盖安装正式版！请在构建库配置 KEYSTORE_* Secrets。'
+          fi
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.abi }}
+          path: |
+            src/dist/keepsake-*.apk
+            src/dist/keepsake-*.sha256
+            src/dist/cert-*.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 3) 建 Release 并上传两个 APK（串行，避免矩阵并发抢同一个 Release）
+  # ---------------------------------------------------------------------------
+  publish:
+    name: 发布 APK
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_REF: ${{ needs.prepare.outputs.ref }}
+    steps:
+      - name: 检出构建库
+        uses: actions/checkout@v4
+
+      - name: 取回构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 归集产物
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.apk' -o -name '*.sha256' \) -exec cp {} dist/ \;
+          ls -l dist
+
+      - name: 写发布说明
+        run: |
+          set -euo pipefail
+          {
+            echo "Keepsake v${VERSION}"
+            echo
+            echo "源码：${SOURCE_REPO:-2806577488/keepsake} @ ${SOURCE_REF}"
+            echo
+            echo "| ABI | 安装包 | 大小 | SHA256 |"
+            echo "| --- | --- | --- | --- |"
+            for apk in dist/keepsake-"${VERSION}"-*.apk; do
+              name="$(basename "$apk")"
+              abi="$(printf '%s' "$name" | sed -E "s/^keepsake-${VERSION}-(.*)\.apk$/\1/")"
+              size="$(stat -c %s "$apk")"
+              sha="$(cut -d' ' -f1 "${apk}.sha256")"
+              echo "| ${abi} | ${name} | ${size} 字节 | \`${sha}\` |"
+            done
+            echo
+            echo "### 签名证书（装不上/签名不一致时先核对这里）"
+            echo
+            echo '```'
+            for cert in dist/cert-"${VERSION}"-*.txt; do
+              if [ -f "$cert" ]; then
+                echo "# $(basename "$cert")"
+                grep -E "Signer #1 certificate (DN|SHA-256)|^Owner:|^SHA256:" "$cert" || cat "$cert"
+                echo
+              fi
+            done
+            echo '```'
+            if grep -ql "Android Debug" dist/cert-"${VERSION}"-*.txt 2>/dev/null; then
+              echo
+              echo "> ⚠️ 本次是 **debug 签名**：不能覆盖安装正式版，且不同构建可能不同签名。"
+              echo "> 请在构建库配置 KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD。"
+            fi
+            echo
+            echo "差分补丁见 \`keepsake-${VERSION}-patches.json\`（若有）。"
+            echo "安装说明：arm64 机型用 -arm64.apk，32 位机型用 -arm.apk。"
+          } > notes.md
+          cat notes.md
+
+      - name: 创建或更新 Release
+        run: |
+          set -euo pipefail
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release edit "v${VERSION}" --title "Keepsake v${VERSION}" --notes-file notes.md
+          else
+            gh release create "v${VERSION}" \
+              --title "Keepsake v${VERSION}" \
+              --notes-file notes.md
+          fi
+
+      - name: 上传 APK 与校验文件
+        run: |
+          set -euo pipefail
+          gh release upload "v${VERSION}" dist/* --clobber
+          gh release view "v${VERSION}" --json assets --jq '.assets[].name'
+
+  # ---------------------------------------------------------------------------
+  # 4) 生成差分补丁（上一版 → 这一版），失败只告警，不影响发布
+  # ---------------------------------------------------------------------------
+  patch:
+    name: 生成差分补丁
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: 检出构建库
+        uses: actions/checkout@v4
+
+      - name: 取回新构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 安装 bsdiff
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bsdiff
+          bsdiff 2>&1 | head -3 || true
+
+      - name: 找上一版（构建库里版本号小于当前的最大 Release）
+        id: prev
+        run: |
+          set -euo pipefail
+          CURRENT="$VERSION"
+          PREV=""
+          # 先按版本号升序，逐个比较：保留「比当前小」里最大的那个。
+          TAGS="$(gh release list --limit 50 --json tagName,isDraft \
+            --jq '[.[] | select(.isDraft | not) | .tagName] | .[]' \
+            | sed 's/^v//' | sort -V)"
+          while IFS= read -r TAGVER; do
+            if [ -z "$TAGVER" ]; then
+              continue
+            fi
+            if [ "$TAGVER" = "$CURRENT" ]; then
+              continue
+            fi
+            MAX="$(printf '%s\n%s\n' "$TAGVER" "$CURRENT" | sort -V | tail -1)"
+            if [ "$MAX" = "$CURRENT" ]; then
+              PREV="$TAGVER"
+            fi
+          done <<< "$TAGS"
+          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
+          echo "上一版：${PREV:-（没有历史 Release，本次跳过差分）}"
+
+      - name: 生成补丁并自检
+        if: steps.prev.outputs.prev != ''
+        run: |
+          set -euo pipefail
+          PREV="${{ steps.prev.outputs.prev }}"
+          mkdir -p prev dist out
+          # 新包从 artifact 里取（与已上传 Release 的是同一份字节）。
+          find artifacts -name '*.apk' -exec cp {} dist/ \;
+          find artifacts -name 'cert-*.txt' -exec cp {} dist/ \; || true
+          ls -l dist
+
+          ENTRIES=""
+          for ABI in arm64 arm; do
+            NEW_APK="dist/keepsake-${VERSION}-${ABI}.apk"
+            if [ ! -f "$NEW_APK" ]; then
+              echo "警告：缺少 ${ABI} 新包，跳过该 ABI 的补丁" >&2
+              continue
+            fi
+
+            # 上一版同 ABI 的包；老版本可能只有 universal 包。
+            OLD_APK=""
+            for CAND in "keepsake-${PREV}-${ABI}.apk" "keepsake-${PREV}-universal.apk"; do
+              if gh release download "v${PREV}" --pattern "$CAND" --dir prev --clobber 2>/dev/null; then
+                if [ -f "prev/${CAND}" ]; then OLD_APK="prev/${CAND}"; break; fi
+              fi
+            done
+            if [ -z "$OLD_APK" ]; then
+              echo "警告：v${PREV} 里找不到 ${ABI} 可用的旧包，跳过这个 ABI 的补丁" >&2
+              continue
+            fi
+
+            # 签名一致性守卫：旧版与新版证书不同 → 用户根本装不上，补丁无意义。
+            gh release download "v${PREV}" --pattern "cert-${PREV}-${ABI}.txt" \
+              --dir prev --clobber 2>/dev/null || true
+            OLD_CERT="prev/cert-${PREV}-${ABI}.txt"
+            NEW_CERT="dist/cert-${VERSION}-${ABI}.txt"
+            if [ -f "$OLD_CERT" ] && [ -f "$NEW_CERT" ]; then
+              OLD_FP="$(grep -Eo 'SHA-256[^:]*: *[0-9a-fA-F:]{32,}' "$OLD_CERT" | head -1 || true)"
+              NEW_FP="$(grep -Eo 'SHA-256[^:]*: *[0-9a-fA-F:]{32,}' "$NEW_CERT" | head -1 || true)"
+              if [ -n "$OLD_FP" ] && [ -n "$NEW_FP" ] && [ "$OLD_FP" != "$NEW_FP" ]; then
+                echo "::warning::${ABI}: v${PREV} 与 v${VERSION} 签名证书不同，用户无法覆盖安装 → 跳过差分补丁。请统一 keystore。"
+                continue
+              fi
+            fi
+
+            PATCH_NAME="keepsake-${PREV}-to-${VERSION}-${ABI}.patch"
+            ENTRY="out/entry-${ABI}.json"
+            if ! python3 tool/make_patch.py make \
+              --old "$OLD_APK" \
+              --new "$NEW_APK" \
+              --out "out/${PATCH_NAME}" \
+              --from "$PREV" --to "$VERSION" --abi "$ABI" \
+              --from-apk "$(basename "$OLD_APK")" \
+              --target-apk "$(basename "$NEW_APK")" \
+              --entry "$ENTRY"; then
+              echo "警告：${ABI} 补丁生成失败（不影响本次发布）" >&2
+              continue
+            fi
+
+            # 补丁比整包还大就没意义：超过旧包 90% 直接丢弃。
+            PATCH_SIZE="$(stat -c %s "out/${PATCH_NAME}")"
+            OLD_SIZE="$(stat -c %s "$OLD_APK")"
+            if [ "$PATCH_SIZE" -ge $((OLD_SIZE * 9 / 10)) ]; then
+              echo "警告：${ABI} 补丁 ${PATCH_SIZE} 字节 ≥ 旧包 90%，丢弃（全量更划算）" >&2
+              rm -f "out/${PATCH_NAME}" "$ENTRY"
+              continue
+            fi
+            ENTRIES="$ENTRIES --entry $ENTRY"
+          done
+
+          if [ -z "$ENTRIES" ]; then
+            echo '本次没有可用的差分补丁（首次发布 / 旧包缺失 / 签名不一致都属正常）'
+            exit 0
+          fi
+
+          # shellcheck disable=SC2086
+          python3 tool/make_patch.py merge \
+            --version "$VERSION" $ENTRIES \
+            --out "out/keepsake-${VERSION}-patches.json" \
+            --notes-out "out/patch-notes.md"
+          ls -l out
+
+      - name: 上传补丁
+        if: steps.prev.outputs.prev != ''
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          FILES=(out/*.patch out/*-patches.json)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo '没有补丁文件需要上传'
+            exit 0
+          fi
+          gh release upload "v${VERSION}" "${FILES[@]}" --clobber
+          gh release view "v${VERSION}" --json assets --jq '.assets[].name'
+
+      - name: 补丁信息写入 Release 说明
+        if: steps.prev.outputs.prev != ''
+        run: |
+          set -euo pipefail
+          if [ ! -f out/patch-notes.md ]; then
+            echo '没有补丁表格需要写入'
+            exit 0
+          fi
+          cat out/patch-notes.md >> notes.md
+          gh release edit "v${VERSION}" --notes-file notes.md
+          tail -20 notes.md
+
+      - name: 清理旧 Release（保留最近 ${KEEP_RELEASES:-10} 个）
+        run: |
+          set -euo pipefail
+          KEEP="${KEEP_RELEASES:-10}"
+          OLD="$(gh release list --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .['"$KEEP"':] | .[].tagName')"
+          if [ -z "$OLD" ]; then
+            echo '没有需要清理的旧 Release'
+            exit 0
+          fi
+          for TAG in $OLD; do
+            echo "删除旧 Release：$TAG（保留最近 $KEEP 个）"
+            gh release delete "$TAG" --yes --cleanup-tag || echo "警告：删除 $TAG 失败" >&2
+          done

@@ -1,0 +1,15 @@
+# 构建中间产物
+dist/
+prev/
+out/
+artifacts/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 绝不入库的签名材料（CI 里从 Secrets 解出来，本机也别提交）
+*.jks
+*.keystore
+key.properties
+android/keystore.jks
