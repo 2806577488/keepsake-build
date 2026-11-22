@@ -77,8 +77,9 @@ for %%A in (arm64 arm) do (
   if "!SKIP_BUILD!"=="1" (
     echo [!STEP!/3] flutter build apk --target-platform android-%%A  -- SKIPPED
   ) else (
-    echo [!STEP!/3] flutter build apk --release --target-platform android-%%A (abiFilters=%%A)
-    rem 只保留目标 ABI：否则插件 so 会被打进其余 ABI 目录，x86_64 设备误选后启动崩。
+    echo [!STEP!/3] flutter build apk --release --target-platform android-%%A abiFilters=%%A
+    rem Only keep the target ABI: plugin .so files otherwise land in every ABI dir,
+    rem and x86_64 devices pick that dir then crash on startup with no libflutter.so.
     set "ORG_GRADLE_PROJECT_keepsakeAbi=%%A"
     call flutter build apk --release --target-platform android-%%A
     if errorlevel 1 (

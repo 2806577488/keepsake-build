@@ -220,15 +220,21 @@ def apply_ksd1(old_path: str, patch_path: str, out_path: str) -> int:
         dpos += diff_len
         if len(delta) != diff_len:
             fail("diff 段不够用（补丁被截断）")
-        # 旧包越界部分按 0 处理，与 App 端一致。
-        if old_pos < 0:
-            base = b""
-        else:
-            base = old[old_pos : old_pos + diff_len]
-        if base:
-            chunks.append(_add_bytes(base, delta))
-        else:
+        # 逐字节语义：越界（<0 或 >= oldSize）的旧字节按 0 加；跨界时只处理
+        # 落在 old 里的那一段。之前「old_pos < 0 就整段当 0」在跨 0 边界时
+        # 会丢掉后半段的旧字节——CI 自检在 1119376 处抓到：期望 0x174、
+        # 还原成 0x00。
+        start = max(0, old_pos)
+        end = min(len(old), old_pos + diff_len)
+        if end <= start:
             chunks.append(delta)
+        else:
+            head = b"\x00" * (start - old_pos)
+            tail = b"\x00" * (old_pos + diff_len - end)
+            offset_in_delta = start - old_pos
+            mid_delta = delta[offset_in_delta : offset_in_delta + (end - start)]
+            mid = _add_bytes(old[start:end], mid_delta)
+            chunks.append(head + mid + tail)
 
         piece = extra[epos : epos + extra_len]
         epos += extra_len
