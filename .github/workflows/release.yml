@@ -303,21 +303,21 @@ jobs:
               echo "| ${abi} | ${name} | ${size} 字节 | \`${sha}\` |"
             done
             echo
-            echo "### 签名证书（装不上/签名不一致时先核对这里）"
+            echo "签名指纹（装不上时核对）"
             echo
-            echo '```'
+            echo "<details>"
+            echo
             for cert in dist/cert-"${VERSION}"-*.txt; do
               if [ -f "$cert" ]; then
-                echo "# $(basename "$cert")"
-                grep -E "Signer #1 certificate (DN|SHA-256)|^Owner:|^SHA256:" "$cert" || cat "$cert"
+                echo "- $(basename "$cert")"
+                grep -E "Signer #1 certificate (DN|SHA-256)" "$cert" || cat "$cert"
                 echo
               fi
             done
-            echo '```'
+            echo "</details>"
             if grep -ql "Android Debug" dist/cert-"${VERSION}"-*.txt 2>/dev/null; then
               echo
-              echo "> ⚠️ 本次是 **debug 签名**：不能覆盖安装正式版，且不同构建可能不同签名。"
-              echo "> 请在构建库配置 KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD。"
+              echo "> 注意：本次是 debug 签名，不能覆盖安装正式版。"
             fi
             echo
             echo "差分补丁见 \`keepsake-${VERSION}-patches.json\`（若有）。"
