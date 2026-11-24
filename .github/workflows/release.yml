@@ -323,6 +323,10 @@ jobs:
             echo "差分补丁见 \`keepsake-${VERSION}-patches.json\`（若有）。"
             echo "安装说明：arm64 机型用 -arm64.apk，32 位机型用 -arm.apk。"
           } > notes.md
+          # E-03 / N-7：发行说明也作为**资产**上传（IMPLEMENTATION-<ver>.md），
+          # 版本与哈希都来自本次构建产物，不再手写文档。
+          mkdir -p dist
+          cp notes.md "dist/IMPLEMENTATION-${VERSION}.md"
           cat notes.md
 
       - name: 创建或更新 Release

@@ -51,9 +51,11 @@ Release tag = `v<version>`（例如 `v0.4.21`）。App 内版本比较按语义�
 | --- | --- |
 | `keepsake-<ver>-arm64.apk` | 64 位（arm64-v8a）安装包 |
 | `keepsake-<ver>-arm.apk` | 32 位（armeabi-v7a）安装包 |
-| `keepsake-<ver>-<abi>.apk.sha256` | 一行：`<sha256>  <文件名>` |
+| `keepsake-<ver>-<abi>.apk.sha256` | 一行：`<sha256>  <文件名>`（App 下载完整包后强制校验，E-24） |
 | `keepsake-<from>-to-<to>-<abi>.patch` | 差分补丁（KSD1 容器） |
 | `keepsake-<ver>-patches.json` | 补丁元数据（App 靠它决定能不能走差分） |
+| `IMPLEMENTATION-<ver>.md` | 本次构建的发行说明（版本/大小/哈希/签名指纹，由 CI 生成，E-03/N-7） |
+| `cert-<ver>-<abi>.txt` | 签名证书信息（装不上时核对用） |
 
 老版本（v0.4.19 及以前，还在源码库那边）可能有 `keepsake-<ver>-universal.apk`；
 App 侧对不上本机 ABI 时会回退到通用包，补丁生成也兼容把 universal 当旧包。
