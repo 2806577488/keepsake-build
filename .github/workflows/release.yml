@@ -367,6 +367,9 @@ jobs:
             fi
             echo
             echo "差分补丁见 \`keepsake-${VERSION}-patches.json\`（若有）。"
+            # 这里必须多一个空行：GitHub 的 Markdown 把「单换行」当软换行，
+            # 两句只有 1 个换行时会渲染成同一段（看着像换行没生效）。
+            echo
             echo "安装说明：arm64 机型用 -arm64.apk，32 位机型用 -arm.apk。"
           } > notes.md
           # E-03 / N-7：发行说明也作为**资产**上传（IMPLEMENTATION-<ver>.md），
