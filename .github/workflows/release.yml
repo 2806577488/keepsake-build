@@ -282,7 +282,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          find artifacts -type f \( -name '*.apk' -o -name '*.sha256' \) -exec cp {} dist/ \;
+          # 证书文件也要进 dist：① Release 正文的「签名指纹」区块靠它；
+          # ② cert-<ver>-<abi>.txt 是按 RELEASE.md §4 要上传的资产；
+          # ③ 下游「差分补丁」job 的签名一致性守卫要拿它和上一版比对。
+          # 之前只 copy 了 apk/sha256，正文里那段 <details> 永远是空的。
+          find artifacts -type f \
+            \( -name '*.apk' -o -name '*.sha256' -o -name 'cert-*.txt' \) \
+            -exec cp {} dist/ \;
           ls -l dist
 
       - name: 取源码库 tag 上的更新日志
