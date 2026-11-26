@@ -61,6 +61,10 @@ jobs:
         working-directory: src
         run: flutter pub get
 
+      # 复用 Gradle 依赖缓存：上一轮冷启动 Gradle 占了总时长的大半。
+      - name: 缓存 Gradle
+        uses: gradle/actions/setup-gradle@v4
+
       - name: 静态分析
         if: github.event.inputs.analyze == 'true'
         continue-on-error: true
