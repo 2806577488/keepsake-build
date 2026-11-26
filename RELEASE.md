@@ -136,19 +136,32 @@ JDK 自带的 `Inflater` 解，纯 Kotlin，无 NDK/JNI。
 36..    ctrl | diff | extra       三段 raw deflate
 ```
 
-### 6.3 CI 生成流程
+### 6.3 CI 生成流程（最近 3 个版本 × 每版一个并行 job）
 
-1. 构建出两个新 APK 并上传 Release；
-2. 从**本仓库历史 Release** 里找版本号小于当前的最大版本（上一版）；
-3. 逐个 ABI 下载上一版同 ABI 的 APK（找不到就试 `-universal.apk`）；
-4. `bsdiff old.apk new.apk raw.bspatch` → `make_patch.py make` 转码 KSD1；
-5. **自检**：用 `make_patch.py` 里的独立 Python 实现把补丁套回旧包，
-   sha256 必须等于新包，否则删除补丁并跳过（发布不受影响）；
-6. 补丁大小 ≥ 旧包 90% 视为无意义，丢弃；
-7. 合并元数据 → `keepsake-<ver>-patches.json` 上传；
-8. Release 说明里追加补丁表。
+差分补丁不只为「相邻上一版」生成，而是**最近 3 个比当前小的 Release** 各生成一份
+（`prepare` 输出 `patch_from`，最多 3 个版本）——用户跳过一两个版本升级也能差分。
+
+1. `prepare` 解析版本，并算出 `patch_from`（最近 3 个更小的已发布版本）；
+2. 两个 ABI 构建并发布；
+3. `patch` **matrix**（每个 from 版本一个 job，并行）：
+   - 从**旧 Release** 下载该版本的 APK 与 `cert-<from>-<abi>.txt`；
+   - 签名指纹不一致 → 跳过该 ABI（`::warning::`）；
+   - `bsdiff old.apk new.apk` → `make_patch.py make` 转码 KSD1；
+   - **自检**：补丁套回旧包必须逐字节等于新包；补丁 ≥ 旧包 90% 丢弃；
+   - 上传补丁文件 + 条目元数据 artifact（文件名带 from 版本，避免并行汇总时同名覆盖）；
+4. `patch-metadata` 汇总所有条目：
+   - 用**内联 python** 拼 `keepsake-<ver>-patches.json` 与说明表格
+     （不再调用 `make_patch.py merge` 的 argparse 入口——6 个条目并行上传时
+     那个 CLI 解析失败过一次）；
+   - 上传 `patches.json`、把表格追加到 Release 说明；
+   - 清理旧 Release（保留最近 10 个）。
 
 补丁生成是**尽力而为**：任何一步失败都只告警，不阻塞发布（App 会全量下载）。
+
+> **历史补记（0.4.39 / 0.4.40）**：这两版的补丁由并行 job 正常上传，但「汇总」job
+> 跑的是修复前的工作流，所以当时**没有 `patches.json`**，是手工补齐的。
+> 手工补齐的要点：`from_sha256` 必须取自**旧版本 Release** 的 `keepsake-<from>-<abi>.apk.sha256`
+> （不在当前 Release 里），否则 App 端校验不过、补丁会被跳过。**从 0.4.41 起自动生成。**
 
 ### 6.4 元数据格式
 
@@ -218,6 +231,7 @@ build\abi\keepsake-<版本>-arm.apk(.sha256)
 | --- | --- |
 | 装不上/覆盖安装失败 | 签名是否一致（debug vs 正式），`KEYSTORE_*` 是否配好 |
 | App 提示没有可用更新 | 是否发布到**本仓库**；tag 是否为 `v<ver>` 且不是 draft |
-| 只有全量下载，没有差分 | `-patches.json` 是否存在；上一版 Release 是否被清理掉（保留 10 个） |
+| 只有全量下载，没有差分 | `-patches.json` 是否存在；上一版 Release 是否被清理掉（保留 10 个）；`from_sha256` 是否为空 |
+| Release 有 patch 文件但没有 `patches.json` | 「补丁汇总」job 是否失败（看「合并 patches.json」步骤）；旧版需按 §6.3 补记手工补 |
 | 差分合并失败 | CI 的自检步骤是否通过；`from_sha256` 与本机 APK 是否一致 |
 | 32 位机装不上 arm64 包 | 资产名是否写成 `-arm.apk`（不能用 universal 混过去） |
