@@ -591,10 +591,43 @@ jobs:
             echo "::warning::Release 还没建好，跳过补丁汇总（APK 发布不受影响）"
             exit 0
           fi
-          python3 tool/make_patch.py merge \
-            --version "$VERSION" "${ENTRIES[@]}" \
-            --out "keepsake-${VERSION}-patches.json" \
-            --notes-out patch-notes.md
+          # 用内联 python 直接拼 patches.json + 表格：不依赖 make_patch.py 的
+          # argparse（并行 job 的 entries 是 6 个文件，之前 CLI 解析那一步失败过）。
+          python3 - <<'PY'
+          import glob, json, os
+
+          version = os.environ['VERSION']
+          paths = sorted(glob.glob('entries/*.json'))
+          entries = []
+          for path in paths:
+              with open(path, encoding='utf-8') as handle:
+                  entries.append(json.load(handle))
+          entries.sort(key=lambda item: (item.get('abi', ''), item.get('name', '')))
+          payload = {
+              'version': version,
+              'patch_format': 'KSD1 (bsdiff semantics, zlib sections)',
+              'patches': entries,
+          }
+          with open(f'keepsake-{version}-patches.json', 'w', encoding='utf-8') as handle:
+              json.dump(payload, handle, ensure_ascii=False, indent=2)
+              handle.write('\n')
+          lines = [
+              '',
+              f'### 差分更新（最近三版 → {version}）',
+              '',
+              '| 目标 ABI | 补丁 | 大小 | 需要本机是 |',
+              '| --- | --- | --- | --- |',
+          ]
+          for item in entries:
+              lines.append(
+                  f"| {item['abi']} | `{item['name']}` | "
+                  f"{item['patch_size']} 字节 | {item['from_apk']} |"
+              )
+          lines.append('')
+          with open('patch-notes.md', 'w', encoding='utf-8') as handle:
+              handle.write('\n'.join(lines))
+          print(f'合并 {len(entries)} 个补丁条目')
+          PY
           gh release upload "v${VERSION}" "keepsake-${VERSION}-patches.json" --clobber
           ls -l patch-notes.md && tail -20 patch-notes.md
 
