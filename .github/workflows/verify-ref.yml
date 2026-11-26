@@ -1,0 +1,115 @@
+# 验证某个 keepsake 源码 ref（只编译 / 可下载 APK），**不发版**。
+#
+# 与 release.yml 的区别：不建 tag、不建 Release、不动已有资产，
+# 适合验证分支上的修复（例如 fix/chat-scroll）能不能编译、能不能装。
+#
+# 触发：Actions → 「验证某个 ref（只编译，不发版）」→ Run workflow
+name: 验证某个 ref（只编译，不发版）
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'keepsake 源码 ref（分支 / tag / sha）'
+        required: true
+        default: 'main'
+      abi:
+        description: '目标 ABI（arm64 / arm / universal）'
+        required: false
+        default: 'arm64'
+      analyze:
+        description: '先跑 flutter analyze（true/false；只记录，不阻断构建）'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: 2806577488/keepsake
+  KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+  KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+  KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+  KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+jobs:
+  verify:
+    name: 编译 ${{ github.event.inputs.source_ref }} · ${{ github.event.inputs.abi }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码库
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ github.event.inputs.source_ref }}
+          path: src
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.50.1
+          cache: true
+
+      - name: 安装依赖
+        working-directory: src
+        run: flutter pub get
+
+      - name: 静态分析
+        if: github.event.inputs.analyze == 'true'
+        continue-on-error: true
+        working-directory: src
+        run: flutter analyze --no-fatal-infos
+
+      - name: 配置 release 签名
+        if: env.KEYSTORE_BASE64 != ''
+        working-directory: src
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > android/keystore.jks
+          {
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyPassword=$KEY_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "storeFile=keystore.jks"
+          } > android/key.properties
+          test -s android/keystore.jks
+          echo '已写入 keystore（与正式版同一签名，可直接覆盖安装）'
+
+      - name: 未配置签名时的提示
+        if: env.KEYSTORE_BASE64 == ''
+        run: |
+          echo '::warning::未配置 KEYSTORE_* Secrets，本次是 debug 签名，不能覆盖安装正式版。'
+          echo '::warning::装之前先卸载旧版（会丢 App 内数据）。'
+
+      - name: 构建 APK
+        working-directory: src
+        run: |
+          set -euo pipefail
+          ABI="${{ github.event.inputs.abi }}"
+          if [ "$ABI" = 'universal' ]; then
+            flutter build apk --release
+          else
+            flutter build apk --release --target-platform "android-${ABI}"
+          fi
+          OUT="keepsake-verify-${ABI}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "$OUT"
+          ls -l "$OUT"
+          sha256sum "$OUT" > "$OUT.sha256"
+          cat "$OUT.sha256"
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepsake-verify-${{ github.event.inputs.abi }}
+          path: |
+            src/keepsake-verify-*.apk
+            src/keepsake-verify-*.apk.sha256
+          if-no-files-found: error
+          retention-days: 5
