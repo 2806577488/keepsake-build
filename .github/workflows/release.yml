@@ -285,10 +285,50 @@ jobs:
           find artifacts -type f \( -name '*.apk' -o -name '*.sha256' \) -exec cp {} dist/ \;
           ls -l dist
 
+      - name: 取源码库 tag 上的更新日志
+        id: changelog
+        env:
+          # 源码库是公开的；这里走 git 协议读 tag 注释，避开 API 限流。
+          SRC_REPO: 2806577488/keepsake
+        run: |
+          set -euo pipefail
+          LOG=""
+          if printf '%s' "${SOURCE_REF:-}" | grep -qE '^v[0-9]'; then
+            rm -rf /tmp/srctag
+            if git clone --quiet --depth 1 --branch "$SOURCE_REF" \
+                 "https://github.com/${SRC_REPO}.git" /tmp/srctag 2>/dev/null; then
+              # 优先用 annotated tag 的注释正文（就是发版时写的更新日志）。
+              LOG="$(git -C /tmp/srctag tag -l --format='%(contents)' "$SOURCE_REF" || true)"
+              if [ -z "$(printf '%s' "$LOG" | tr -d '[:space:]')" ]; then
+                # lightweight tag：退回 commit message。
+                LOG="$(git -C /tmp/srctag log -1 --pretty=%B || true)"
+              fi
+            fi
+          fi
+          {
+            echo 'changelog<<KEEPSAKE_CHANGELOG_EOF'
+            printf '%s\n' "$LOG"
+            echo 'KEEPSAKE_CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "更新日志行数：$(printf '%s' "$LOG" | wc -l)"
+          printf '%s\n' "$LOG" | head -20
+
       - name: 写发布说明
+        env:
+          # App 更新器显示的就是 Release body（update_service 读 body → notes），
+          # 所以把源码库 tag 的更新日志放在最前面。
+          CHANGELOG: ${{ steps.changelog.outputs.changelog }}
         run: |
           set -euo pipefail
           {
+            if [ -n "$(printf '%s' "${CHANGELOG:-}" | tr -d '[:space:]')" ]; then
+              echo "## 本次更新"
+              echo
+              printf '%s\n' "$CHANGELOG"
+              echo
+              echo "---"
+              echo
+            fi
             echo "Keepsake v${VERSION}"
             echo
             echo "源码：${SOURCE_REPO:-2806577488/keepsake} @ ${SOURCE_REF}"
@@ -500,6 +540,10 @@ jobs:
             echo '没有补丁表格需要写入'
             exit 0
           fi
+          # 先在现有正文上追加：这个 job 是新 runner，本地没有上一个 job 的 notes.md，
+          # 直接 `>> notes.md` 会当成新文件，再用 --notes-file 发布就等于把
+          # 更新日志和 APK 表格整个覆盖掉。
+          gh release view "v${VERSION}" --json body --jq .body > notes.md
           cat out/patch-notes.md >> notes.md
           gh release edit "v${VERSION}" --notes-file notes.md
           tail -20 notes.md
