@@ -149,11 +149,21 @@ jobs:
           java-version: '17'
 
       - name: 安装 Flutter
+        id: flutter-action
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           flutter-version: 3.50.1
+          # SDK 缓存（含 bin/cache 里的引擎产物）+ pub 缓存各受一个开关控制。
+          # 两个都开：否则每个 runner 都要重新拉引擎产物。
           cache: true
+          pub-cache: true
+
+      - name: 打印缓存命中（排查慢构建用）
+        run: |
+          echo "Flutter SDK cache-hit: ${{ steps.flutter-action.outputs.CACHE-HIT }}"
+          echo "pub cache-hit: ${{ steps.flutter-action.outputs.PUB-CACHE-HIT }}"
+          echo "FLUTTER_ROOT: $FLUTTER_ROOT"
 
       - name: 安装依赖
         working-directory: src
@@ -400,7 +410,9 @@ jobs:
   # ---------------------------------------------------------------------------
   patch:
     name: 生成差分补丁
-    needs: [prepare, publish]
+    # 与 publish 并行：补丁只需要「本次构建产物 + 上一版 Release」，不必等发布写完。
+    # 上传前用 `等 Release 建好` 那一步做同步（最多等 2 分钟）。
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -417,8 +429,12 @@ jobs:
       - name: 安装 bsdiff
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq bsdiff
+          # 先直接装：托管 runner 的镜像里包索引基本都在，省掉 `apt-get update`（实测 ~20s）；
+          # 索引缺失时才回退到 update。
+          if ! sudo apt-get install -y -qq bsdiff >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq bsdiff
+          fi
           bsdiff 2>&1 | head -3 || true
 
       - name: 找上一版（构建库里版本号小于当前的最大 Release）
@@ -528,8 +544,26 @@ jobs:
             --notes-out "out/patch-notes.md"
           ls -l out
 
-      - name: 上传补丁
+      - name: 等 Release 建好（与发布 job 并行）
+        id: ready
         if: steps.prev.outputs.prev != ''
+        run: |
+          set -euo pipefail
+          # patch 与 publish 并行跑：上传补丁前必须确认 Release 已存在。
+          # 等不到就只告警、不失败——APK 已经发出去了，补丁失败不该把跑批染红。
+          for i in $(seq 1 60); do
+            if gh release view "v${VERSION}" >/dev/null 2>&1; then
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              echo "Release v${VERSION} 已就绪（第 ${i} 次探测）"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::等了 2 分钟 Release 还没建好，跳过补丁上传（APK 发布不受影响）"
+
+      - name: 上传补丁
+        if: steps.prev.outputs.prev != '' && steps.ready.outputs.ready == 'true'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -542,7 +576,7 @@ jobs:
           gh release view "v${VERSION}" --json assets --jq '.assets[].name'
 
       - name: 补丁信息写入 Release 说明
-        if: steps.prev.outputs.prev != ''
+        if: steps.prev.outputs.prev != '' && steps.ready.outputs.ready == 'true'
         run: |
           set -euo pipefail
           if [ ! -f out/patch-notes.md ]; then
@@ -558,8 +592,15 @@ jobs:
           tail -20 notes.md
 
       - name: 清理旧 Release（保留最近 ${KEEP_RELEASES:-10} 个）
+        # 与发布并行时「新 Release 是否已建好」不一定，这里自己兜底判断：
+        # 没建好就跳过（下次发版再清；绝不能在建好前按 createdAt 排序删错人）。
+        if: always()
         run: |
           set -euo pipefail
+          if ! gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo '新 Release 还没建好，本轮跳过清理'
+            exit 0
+          fi
           KEEP="${KEEP_RELEASES:-10}"
           OLD="$(gh release list --limit 100 --json tagName,createdAt \
             --jq 'sort_by(.createdAt) | reverse | .['"$KEEP"':] | .[].tagName')"
