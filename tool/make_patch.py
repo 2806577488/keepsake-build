@@ -72,6 +72,21 @@ MAGIC = b"KSD1"
 BSDIFF_MAGIC = b"BSDIFF40"
 HEADER_SIZE = 36
 
+
+def offtin(buf: bytes) -> int:
+    """bsdiff 的整数编码：**符号位 + 绝对值**（不是补码）。
+
+    bspatch.c 的 offtin()：低 7 字节按小端拼出绝对值，**最高字节的最高位是符号位**，
+    置位表示负数。用 `struct.unpack('<q')` 读会把它当成补码 —— 于是 `seek=-1`
+    读出来是 `-9223372036854775807`，old_pos 直接飞到 2^63 之外，
+    跟出来的字节全被当成"旧包越界"处理。历史上「差分补丁一个都出不来」
+    就是这个原因（CI 自检每次都在 ~1.1MB 处第一次失配）。
+    """
+    magnitude = buf[7] & 0x7F
+    for i in range(6, -1, -1):
+        magnitude = (magnitude << 8) | buf[i]
+    return -magnitude if buf[7] & 0x80 else magnitude
+
 # 0..255 + 0..255 的取模 256 加法表：索引 i*256 + j。
 # 用 bytes.translate/map 走 C 层，比逐字节 Python 循环快几倍。
 _ADD_TABLE = bytes(((i + j) & 0xFF) for i in range(256) for j in range(256))
@@ -209,7 +224,9 @@ def apply_ksd1(old_path: str, patch_path: str, out_path: str) -> int:
     while produced < new_size:
         if cpos + 24 > len(ctrl):
             fail("控制段不够用（补丁被截断）")
-        diff_len, extra_len, seek = struct.unpack("<qqq", ctrl[cpos : cpos + 24])
+        diff_len = offtin(ctrl[cpos : cpos + 8])
+        extra_len = offtin(ctrl[cpos + 8 : cpos + 16])
+        seek = offtin(ctrl[cpos + 16 : cpos + 24])
         cpos += 24
         if diff_len < 0 or extra_len < 0:
             fail(f"控制段长度非法（{diff_len}/{extra_len}）")
@@ -220,20 +237,20 @@ def apply_ksd1(old_path: str, patch_path: str, out_path: str) -> int:
         dpos += diff_len
         if len(delta) != diff_len:
             fail("diff 段不够用（补丁被截断）")
-        # 逐字节语义：越界（<0 或 >= oldSize）的旧字节按 0 加；跨界时只处理
-        # 落在 old 里的那一段。之前「old_pos < 0 就整段当 0」在跨 0 边界时
-        # 会丢掉后半段的旧字节——CI 自检在 1119376 处抓到：期望 0x174、
-        # 还原成 0x00。
+        # bspatch 语义：新字节 = diff 字节 + 对应位置的旧字节；旧字节**越界**
+        # （<0 或 >= oldSize）时按 0 相加，也就是原样保留 diff 字节。
+        # 注意：越界部分要取 **delta 里的那一段**，不能填 0 —— 填 0 就是把
+        # 新包的字节抹成 0x00（CI 自检在 1119376 抓到过：期望 0x174、还原成 0x00）。
         start = max(0, old_pos)
         end = min(len(old), old_pos + diff_len)
         if end <= start:
             chunks.append(delta)
         else:
-            head = b"\x00" * (start - old_pos)
-            tail = b"\x00" * (old_pos + diff_len - end)
-            offset_in_delta = start - old_pos
-            mid_delta = delta[offset_in_delta : offset_in_delta + (end - start)]
-            mid = _add_bytes(old[start:end], mid_delta)
+            skip = start - old_pos  # 开头落在旧包外的字节数（old_pos >= 0 时为 0）
+            mid_len = end - start
+            head = delta[:skip]
+            mid = _add_bytes(old[start:end], delta[skip : skip + mid_len])
+            tail = delta[skip + mid_len :]
             chunks.append(head + mid + tail)
 
         piece = extra[epos : epos + extra_len]
