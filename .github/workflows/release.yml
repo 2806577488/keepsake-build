@@ -55,6 +55,7 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       ref: ${{ steps.resolve.outputs.ref }}
       build: ${{ steps.resolve.outputs.build }}
+      patch_from: ${{ steps.resolve.outputs.patch_from }}
     steps:
       - name: 检出构建库
         uses: actions/checkout@v4
@@ -106,6 +107,21 @@ jobs:
               BUILD="false"
             fi
           fi
+
+          # 最近 3 个比当前小的已发布版本（跳版本也能差分更新）
+          TAGS="$(gh release list --limit 50 --json tagName,isDraft \
+            --jq '[.[] | select(.isDraft | not) | .tagName] | .[]' \
+            | sed 's/^v//' | sort -V)"
+          PREV=""
+          for TAGVER in $TAGS; do
+            [ -z "$TAGVER" ] && continue
+            [ "$TAGVER" = "$VERSION" ] && continue
+            MAX="$(printf '%s\n%s\n' "$TAGVER" "$VERSION" | sort -V | tail -1)"
+            if [ "$MAX" = "$VERSION" ]; then PREV="$PREV $TAGVER"; fi
+          done
+          PREV_JSON="$(printf '%s\n' $PREV | python3 -c 'import sys,json;items=[line.strip() for line in sys.stdin if line.strip()];print(json.dumps(items[-3:]))')"
+          echo "patch_from=${PREV_JSON}" >> "$GITHUB_OUTPUT"
+          echo "补丁来源版本：${PREV_JSON}"
 
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -406,17 +422,25 @@ jobs:
           gh release view "v${VERSION}" --json assets --jq '.assets[].name'
 
   # ---------------------------------------------------------------------------
-  # 4) 生成差分补丁（上一版 → 这一版），失败只告警，不影响发布
+  # 4) 生成差分补丁（最近 3 个版本 × 每个版本一个并行 job）
+  #
+  # 为什么不是"只补相邻上一版"：用户可能跳过一两个版本（0.4.34 → 0.4.36），
+  # 只补相邻版会让他拿到全量包。这里按 prepare 给出的 patch_from（最多 3 个）并行生成，
+  # 每个 from 一个 job，互不阻塞；补丁元数据交给下面的 patch-metadata 汇总。
   # ---------------------------------------------------------------------------
   patch:
-    name: 生成差分补丁
-    # 与 publish 并行：补丁只需要「本次构建产物 + 上一版 Release」，不必等发布写完。
-    # 上传前用 `等 Release 建好` 那一步做同步（最多等 2 分钟）。
+    name: 补丁 ${{ matrix.from }} → ${{ needs.prepare.outputs.version }}
     needs: [prepare, build]
+    if: needs.prepare.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        from: ${{ fromJSON(needs.prepare.outputs.patch_from) }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       VERSION: ${{ needs.prepare.outputs.version }}
+      FROM: ${{ matrix.from }}
     steps:
       - name: 检出构建库
         uses: actions/checkout@v4
@@ -429,51 +453,33 @@ jobs:
       - name: 安装 bsdiff
         run: |
           set -euo pipefail
-          # 先直接装：托管 runner 的镜像里包索引基本都在，省掉 `apt-get update`（实测 ~20s）；
-          # 索引缺失时才回退到 update。
+          # 先直接装（托管 runner 一般已有包索引）；失败才 update，省 ~20s。
           if ! sudo apt-get install -y -qq bsdiff >/dev/null 2>&1; then
             sudo apt-get update -qq
             sudo apt-get install -y -qq bsdiff
           fi
           bsdiff 2>&1 | head -3 || true
 
-      - name: 找上一版（构建库里版本号小于当前的最大 Release）
-        id: prev
+      - name: 等 Release 建好（与发布 job 并行）
         run: |
           set -euo pipefail
-          CURRENT="$VERSION"
-          PREV=""
-          # 先按版本号升序，逐个比较：保留「比当前小」里最大的那个。
-          TAGS="$(gh release list --limit 50 --json tagName,isDraft \
-            --jq '[.[] | select(.isDraft | not) | .tagName] | .[]' \
-            | sed 's/^v//' | sort -V)"
-          while IFS= read -r TAGVER; do
-            if [ -z "$TAGVER" ]; then
-              continue
+          for i in $(seq 1 60); do
+            if gh release view "v${VERSION}" >/dev/null 2>&1; then
+              echo "Release v${VERSION} 已就绪（第 ${i} 次探测）"
+              exit 0
             fi
-            if [ "$TAGVER" = "$CURRENT" ]; then
-              continue
-            fi
-            MAX="$(printf '%s\n%s\n' "$TAGVER" "$CURRENT" | sort -V | tail -1)"
-            if [ "$MAX" = "$CURRENT" ]; then
-              PREV="$TAGVER"
-            fi
-          done <<< "$TAGS"
-          echo "prev=$PREV" >> "$GITHUB_OUTPUT"
-          echo "上一版：${PREV:-（没有历史 Release，本次跳过差分）}"
+            sleep 2
+          done
+          echo "::warning::等了 2 分钟 Release 还没建好，跳过 ${FROM} → ${VERSION} 的补丁"
+          exit 1
 
-      - name: 生成补丁并自检
-        if: steps.prev.outputs.prev != ''
+      - name: 生成补丁（两个 ABI）
         run: |
           set -euo pipefail
-          PREV="${{ steps.prev.outputs.prev }}"
-          mkdir -p prev dist out
-          # 新包从 artifact 里取（与已上传 Release 的是同一份字节）。
+          mkdir -p prev dist out entries
           find artifacts -name '*.apk' -exec cp {} dist/ \;
           find artifacts -name 'cert-*.txt' -exec cp {} dist/ \; || true
-          ls -l dist
 
-          ENTRIES=""
           for ABI in arm64 arm; do
             NEW_APK="dist/keepsake-${VERSION}-${ABI}.apk"
             if [ ! -f "$NEW_APK" ]; then
@@ -481,39 +487,38 @@ jobs:
               continue
             fi
 
-            # 上一版同 ABI 的包；老版本可能只有 universal 包。
             OLD_APK=""
-            for CAND in "keepsake-${PREV}-${ABI}.apk" "keepsake-${PREV}-universal.apk"; do
-              if gh release download "v${PREV}" --pattern "$CAND" --dir prev --clobber 2>/dev/null; then
+            for CAND in "keepsake-${FROM}-${ABI}.apk" "keepsake-${FROM}-universal.apk"; do
+              if gh release download "v${FROM}" --pattern "$CAND" --dir prev --clobber 2>/dev/null; then
                 if [ -f "prev/${CAND}" ]; then OLD_APK="prev/${CAND}"; break; fi
               fi
             done
             if [ -z "$OLD_APK" ]; then
-              echo "警告：v${PREV} 里找不到 ${ABI} 可用的旧包，跳过这个 ABI 的补丁" >&2
+              echo "警告：v${FROM} 里找不到 ${ABI} 包，跳过这个 ABI 的补丁" >&2
               continue
             fi
 
             # 签名一致性守卫：旧版与新版证书不同 → 用户根本装不上，补丁无意义。
-            gh release download "v${PREV}" --pattern "cert-${PREV}-${ABI}.txt" \
-              --dir prev --clobber 2>/dev/null || true
-            OLD_CERT="prev/cert-${PREV}-${ABI}.txt"
+            gh release download "v${FROM}" --pattern "cert-${FROM}-${ABI}.txt" --dir prev --clobber 2>/dev/null || true
+            OLD_CERT="prev/cert-${FROM}-${ABI}.txt"
             NEW_CERT="dist/cert-${VERSION}-${ABI}.txt"
             if [ -f "$OLD_CERT" ] && [ -f "$NEW_CERT" ]; then
               OLD_FP="$(grep -Eo 'SHA-256[^:]*: *[0-9a-fA-F:]{32,}' "$OLD_CERT" | head -1 || true)"
               NEW_FP="$(grep -Eo 'SHA-256[^:]*: *[0-9a-fA-F:]{32,}' "$NEW_CERT" | head -1 || true)"
               if [ -n "$OLD_FP" ] && [ -n "$NEW_FP" ] && [ "$OLD_FP" != "$NEW_FP" ]; then
-                echo "::warning::${ABI}: v${PREV} 与 v${VERSION} 签名证书不同，用户无法覆盖安装 → 跳过差分补丁。请统一 keystore。"
+                echo "::warning::${ABI}: v${FROM} 与 v${VERSION} 签名证书不同，跳过差分补丁"
                 continue
               fi
             fi
 
-            PATCH_NAME="keepsake-${PREV}-to-${VERSION}-${ABI}.patch"
-            ENTRY="out/entry-${ABI}.json"
+            PATCH_NAME="keepsake-${FROM}-to-${VERSION}-${ABI}.patch"
+            # 元数据文件名带 FROM，避免并行 job 的 artifact 汇总时同名覆盖。
+            ENTRY="entries/${FROM}-entry-${ABI}.json"
             if ! python3 tool/make_patch.py make \
               --old "$OLD_APK" \
               --new "$NEW_APK" \
               --out "out/${PATCH_NAME}" \
-              --from "$PREV" --to "$VERSION" --abi "$ABI" \
+              --from "$FROM" --to "$VERSION" --abi "$ABI" \
               --from-apk "$(basename "$OLD_APK")" \
               --target-apk "$(basename "$NEW_APK")" \
               --entry "$ENTRY"; then
@@ -521,79 +526,91 @@ jobs:
               continue
             fi
 
-            # 补丁比整包还大就没意义：超过旧包 90% 直接丢弃。
             PATCH_SIZE="$(stat -c %s "out/${PATCH_NAME}")"
             OLD_SIZE="$(stat -c %s "$OLD_APK")"
             if [ "$PATCH_SIZE" -ge $((OLD_SIZE * 9 / 10)) ]; then
               echo "警告：${ABI} 补丁 ${PATCH_SIZE} 字节 ≥ 旧包 90%，丢弃（全量更划算）" >&2
               rm -f "out/${PATCH_NAME}" "$ENTRY"
-              continue
             fi
-            ENTRIES="$ENTRIES --entry $ENTRY"
           done
+          ls -la out entries || true
 
-          if [ -z "$ENTRIES" ]; then
-            echo '本次没有可用的差分补丁（首次发布 / 旧包缺失 / 签名不一致都属正常）'
-            exit 0
-          fi
-
-          # shellcheck disable=SC2086
-          python3 tool/make_patch.py merge \
-            --version "$VERSION" $ENTRIES \
-            --out "out/keepsake-${VERSION}-patches.json" \
-            --notes-out "out/patch-notes.md"
-          ls -l out
-
-      - name: 等 Release 建好（与发布 job 并行）
-        id: ready
-        if: steps.prev.outputs.prev != ''
-        run: |
-          set -euo pipefail
-          # patch 与 publish 并行跑：上传补丁前必须确认 Release 已存在。
-          # 等不到就只告警、不失败——APK 已经发出去了，补丁失败不该把跑批染红。
-          for i in $(seq 1 60); do
-            if gh release view "v${VERSION}" >/dev/null 2>&1; then
-              echo "ready=true" >> "$GITHUB_OUTPUT"
-              echo "Release v${VERSION} 已就绪（第 ${i} 次探测）"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "ready=false" >> "$GITHUB_OUTPUT"
-          echo "::warning::等了 2 分钟 Release 还没建好，跳过补丁上传（APK 发布不受影响）"
-
-      - name: 上传补丁
-        if: steps.prev.outputs.prev != '' && steps.ready.outputs.ready == 'true'
+      - name: 上传补丁文件
         run: |
           set -euo pipefail
           shopt -s nullglob
-          FILES=(out/*.patch out/*-patches.json)
+          FILES=(out/*.patch)
           if [ ${#FILES[@]} -eq 0 ]; then
             echo '没有补丁文件需要上传'
             exit 0
           fi
           gh release upload "v${VERSION}" "${FILES[@]}" --clobber
-          gh release view "v${VERSION}" --json assets --jq '.assets[].name'
 
-      - name: 补丁信息写入 Release 说明
-        if: steps.prev.outputs.prev != '' && steps.ready.outputs.ready == 'true'
+      - name: 上传补丁元数据（交给汇总 job）
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-entry-${{ matrix.from }}
+          path: entries/
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 5) 汇总补丁元数据 + 写 Release 说明 + 清理旧 Release
+  # ---------------------------------------------------------------------------
+  patch-metadata:
+    name: 补丁汇总
+    needs: [prepare, patch]
+    if: always() && needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: 检出构建库
+        uses: actions/checkout@v4
+
+      - name: 取回所有补丁元数据
+        uses: actions/download-artifact@v4
+        with:
+          pattern: patch-entry-*
+          path: entries
+          merge-multiple: true
+        # 没有任何补丁 job 产出（首次发布）时，这一步不能把汇总 job 染红。
+        continue-on-error: true
+
+      - name: 合并 patches.json 并上传
         run: |
           set -euo pipefail
-          if [ ! -f out/patch-notes.md ]; then
+          shopt -s nullglob
+          ENTRIES=(entries/*.json)
+          if [ ${#ENTRIES[@]} -eq 0 ]; then
+            echo '没有任何补丁元数据（首次发布 / 旧包缺失都属正常），跳过'
+            exit 0
+          fi
+          if ! gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo "::warning::Release 还没建好，跳过补丁汇总（APK 发布不受影响）"
+            exit 0
+          fi
+          python3 tool/make_patch.py merge \
+            --version "$VERSION" "${ENTRIES[@]}" \
+            --out "keepsake-${VERSION}-patches.json" \
+            --notes-out patch-notes.md
+          gh release upload "v${VERSION}" "keepsake-${VERSION}-patches.json" --clobber
+          ls -l patch-notes.md && tail -20 patch-notes.md
+
+      - name: 补丁信息写入 Release 说明
+        run: |
+          set -euo pipefail
+          if [ ! -f patch-notes.md ]; then
             echo '没有补丁表格需要写入'
             exit 0
           fi
-          # 先在现有正文上追加：这个 job 是新 runner，本地没有上一个 job 的 notes.md，
-          # 直接 `>> notes.md` 会当成新文件，再用 --notes-file 发布就等于把
-          # 更新日志和 APK 表格整个覆盖掉。
           gh release view "v${VERSION}" --json body --jq .body > notes.md
-          cat out/patch-notes.md >> notes.md
+          cat patch-notes.md >> notes.md
           gh release edit "v${VERSION}" --notes-file notes.md
           tail -20 notes.md
 
       - name: 清理旧 Release（保留最近 ${KEEP_RELEASES:-10} 个）
-        # 与发布并行时「新 Release 是否已建好」不一定，这里自己兜底判断：
-        # 没建好就跳过（下次发版再清；绝不能在建好前按 createdAt 排序删错人）。
         if: always()
         run: |
           set -euo pipefail
